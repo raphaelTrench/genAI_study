@@ -1,3 +1,4 @@
+import csv
 import inspect
 import json
 import tempfile
@@ -188,6 +189,38 @@ class RetrievalMetricsTests(unittest.TestCase):
             "ground_truth_path"
         ].default
         self.assertEqual(GROUND_TRUTH_JSON_PATH, default_path)
+
+    def test_evaluate_writes_metrics_to_csv_and_appends_new_runs(self) -> None:
+        retriever = FakeRetriever(
+            results={
+                "question": [
+                    Document(page_content="answer", metadata={"doc_id": "doc-1"}),
+                ],
+            }
+        )
+        ground_truth = {
+            "queries": {"q1": "question"},
+            "qrels": {"q1": {"doc-1": 1}},
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            csv_path = Path(tmpdir) / "results.csv"
+            evaluator = Evaluator(
+                ground_truth_path=self.ground_truth_path,
+                k_values=(1,),
+                results_csv_path=csv_path,
+            )
+
+            evaluator.evaluate(retriever, ground_truth, experiment_name="baseline")
+            evaluator.evaluate(retriever, ground_truth, experiment_name="second")
+
+            with csv_path.open("r", encoding="utf-8", newline="") as csv_file:
+                rows = list(csv.DictReader(csv_file))
+
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["experiment_name"], "baseline")
+        self.assertEqual(rows[1]["experiment_name"], "second")
+        self.assertIn("precision@1", rows[0])
 
     def test_explicit_empty_dataset_is_validated_instead_of_using_loaded_data(self) -> None:
         retriever = FakeRetriever(results={})

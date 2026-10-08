@@ -62,7 +62,10 @@ Report retrieval and generation quality separately:
   weighting.
 
 The retrieval metric helper is provider-independent and makes no paid API
-calls. Run its tests with:
+calls. It prints each metric and appends the result row to the fixed CSV at
+`results/evaluation_metrics.csv` (or creates it if missing). Pass
+`experiment_name="baseline"` to `Evaluator.evaluate(...)` or set it on the
+`Evaluator` instance to label the run in the CSV. Run its tests with:
 
 ```bash
 poetry run python -m unittest discover -s evaluation -p 'test_*.py'
