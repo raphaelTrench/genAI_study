@@ -1,7 +1,5 @@
 import argparse
 import json
-import sysconfig
-import warnings
 import uuid
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -15,44 +13,15 @@ from config import (
     GENERATION_MAX_NEW_TOKENS,
     GROUND_TRUTH_JSON_PATH,
 )
+from genai_study.model_client import ModelClient
 from langchain_core.exceptions import OutputParserException
 from langchain_core.output_parsers import PydanticOutputParser, StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnableLambda
 from langchain_core.utils.json import parse_json_markdown
-from langchain_huggingface import HuggingFacePipeline
 from pydantic import BaseModel, Field, field_validator
 
 MAX_PARSE_ATTEMPTS = 3
-
-
-def _disable_triton_bmm_when_python_headers_are_missing(device: int) -> None:
-    if device < 0 or (Path(sysconfig.get_path("include")) / "Python.h").is_file():
-        return
-
-    try:
-        from torch._native.registry import (
-            deregister_op_overrides,
-            get_dsl_operations,
-        )
-    except ImportError:
-        return
-
-    if "bmm" not in get_dsl_operations("triton"):
-        return
-
-    deregister_op_overrides(
-        disable_dsl_names="triton",
-        disable_op_symbols="bmm",
-    )
-    warnings.warn(
-        "Python.h is unavailable, so PyTorch's optional Triton bmm override "
-        "has been disabled. Generation will use PyTorch's standard CUDA "
-        "matrix multiplication. Install the matching Python development "
-        "headers to enable the Triton optimization.",
-        RuntimeWarning,
-        stacklevel=2,
-    )
 
 
 class GeneratedQueries(BaseModel):
@@ -91,8 +60,13 @@ class GeneratedQueries(BaseModel):
 
 
 class SyntheticGenerator:
-    def __init__(self, config: Mapping[str, Any] | None = None) -> None:
+    def __init__(
+        self,
+        config: Mapping[str, Any] | None = None,
+        model_client: ModelClient | None = None,
+    ) -> None:
         self.config = config or {}
+        self.model_client = model_client or ModelClient.from_config(self.config)
         self._chain: Any | None = None
         self._parser = PydanticOutputParser(pydantic_object=GeneratedQueries)
         self._tokenizer: Any | None = None
@@ -108,28 +82,6 @@ class SyntheticGenerator:
         return self._parser.parse(json.dumps(payload))
 
     def _build_chain(self) -> Any:
-        model_id = self.config.get("model_id", DEFAULT_TEXT_GENERATION_MODEL_ID)
-        device = self.config.get("device", DEFAULT_GENERATION_DEVICE)
-        _disable_triton_bmm_when_python_headers_are_missing(device)
-        pipeline_kwargs = {
-            "max_new_tokens": self.config.get(
-                "max_new_tokens", GENERATION_MAX_NEW_TOKENS
-            ),
-            "do_sample": True,
-            "temperature": self.config.get("temperature", 0.7),
-            "return_full_text": False,
-        }
-        model_kwargs = {"local_files_only": self.config.get("local_files_only", False)}
-        pipeline = HuggingFacePipeline.from_model_id(
-            model_id=model_id,
-            task="text-generation",
-            device=device,
-            batch_size=self.config.get("batch_size", GENERATION_BATCH_SIZE),
-            pipeline_kwargs=pipeline_kwargs,
-            model_kwargs=model_kwargs,
-        )
-        self._tokenizer = pipeline.pipeline.tokenizer
-
         prompt = ChatPromptTemplate.from_messages(
             [
                 (
@@ -147,31 +99,13 @@ class SyntheticGenerator:
                 ),
             ]
         ).partial(format_instructions=self._parser.get_format_instructions())
-        return (
-            prompt
-            | RunnableLambda(self._render_chat_prompt)
-            | pipeline
-            | StrOutputParser()
-        )
-
-    def _render_chat_prompt(self, prompt_value: Any) -> str:
-        if self._tokenizer is None:
-            raise RuntimeError("The Hugging Face tokenizer has not been initialized.")
-        messages = prompt_value.to_messages()
-        chat_messages = [
-            {
-                "role": {
-                    "human": "user",
-                    "ai": "assistant",
-                }.get(message.type, message.type),
-                "content": message.content,
-            }
-            for message in messages
-        ]
-        return self._tokenizer.apply_chat_template(
-            chat_messages,
-            tokenize=False,
-            add_generation_prompt=True,
+        return self.model_client.build_chain(
+            prompt,
+            render_prompt=(
+                getattr(self.model_client, "render_chat_prompt", None)
+                if hasattr(self.model_client, "render_chat_prompt")
+                else None
+            ),
         )
 
     def _generate_queries(self, text: str, chain: Any) -> GeneratedQueries:

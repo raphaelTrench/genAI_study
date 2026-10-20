@@ -9,12 +9,19 @@ from pathlib import Path
 from typing import Any
 
 from config import EVALUATION_RESULTS_CSV_PATH, GROUND_TRUTH_JSON_PATH
+from langchain_core.documents import Document
 from langchain_core.retrievers import BaseRetriever
 from ranx import Qrels, Run, evaluate as ranx_evaluate
 
+from evaluation.strategies import (
+    RetrievalStrategy,
+    RetrievalResults,
+    as_retrieval_strategy,
+)
+
 
 class Evaluator:
-    """Evaluate LangChain retrievers against labeled query datasets."""
+    """Evaluate retrieval strategies against labeled query datasets."""
 
     def __init__(
         self,
@@ -23,6 +30,8 @@ class Evaluator:
         max_workers: int = 4,
         experiment_name: str | None = None,
         results_csv_path: Path = EVALUATION_RESULTS_CSV_PATH,
+        fusion_method: str = "rrf",
+        rrf_k: int = 60,
     ) -> None:
         self.k_values = tuple(k_values)
         if not self.k_values or any(k <= 0 for k in self.k_values):
@@ -35,7 +44,13 @@ class Evaluator:
             raise ValueError("max_workers must be a positive integer")
         if experiment_name is not None and not str(experiment_name).strip():
             raise ValueError("experiment_name must be a non-empty string when provided")
+        if fusion_method not in {"rrf", "ordered"}:
+            raise ValueError("fusion_method must be either 'rrf' or 'ordered'")
+        if isinstance(rrf_k, bool) or not isinstance(rrf_k, int) or rrf_k < 1:
+            raise ValueError("rrf_k must be a positive integer")
         self.max_workers = max_workers
+        self.fusion_method = fusion_method
+        self.rrf_k = rrf_k
         self.experiment_name = experiment_name or "unnamed_experiment"
         self.results_csv_path = Path(results_csv_path)
         self.ground_truth_path = Path(ground_truth_path)
@@ -158,29 +173,106 @@ class Evaluator:
 
     def _retrieve_ranked_ids(
         self,
-        retriever: BaseRetriever,
+        strategy: RetrievalStrategy,
         query_id: str,
         query: str,
     ) -> tuple[str, dict[str, float]]:
-        documents = retriever.invoke(query)
-        retrieved_ids: list[str] = []
-        for document in documents:
-            doc_id = document.metadata.get("doc_id")
-            if not isinstance(doc_id, str) or not doc_id:
-                raise ValueError(
-                    f"Retriever result for query {query_id!r} is missing "
-                    "a non-empty 'doc_id' in document metadata"
-                )
-            retrieved_ids.append(doc_id)
+        results = strategy.retrieve(query)
+        return self._score_retrieval_result(query_id, results)
+
+    def _score_retrieval_result(
+        self,
+        query_id: str,
+        results: RetrievalResults,
+    ) -> tuple[str, dict[str, float]]:
+        ranked_ids = self._extract_ranked_ids(results, query_id)
+        retrieved_ids = self._fuse_rankings(ranked_ids)
         return query_id, self._score_ranked_ids(retrieved_ids)
+
+    def _extract_ranked_ids(
+        self,
+        results: RetrievalResults,
+        query_id: str,
+    ) -> list[list[str]]:
+        if isinstance(results, (str, bytes)) or not isinstance(results, Sequence):
+            raise TypeError(
+                f"Retrieval strategy result for query {query_id!r} must be a "
+                "sequence of document IDs/documents or a sequence of ranked lists."
+            )
+
+        if not results:
+            return [[]]
+
+        rankings: Sequence[Any]
+        if isinstance(results[0], (Document, str)):
+            rankings = [results]
+        elif isinstance(results[0], Sequence) and not isinstance(
+            results[0], (str, bytes)
+        ):
+            rankings = results
+        else:
+            raise TypeError(
+                f"Retrieval strategy result for query {query_id!r} has an "
+                "unsupported shape."
+            )
+
+        extracted: list[list[str]] = []
+        for ranking in rankings:
+            if isinstance(ranking, (str, bytes)) or not isinstance(ranking, Sequence):
+                raise TypeError(
+                    f"Ranked results for query {query_id!r} must be a sequence."
+                )
+            ids: list[str] = []
+            for item in ranking:
+                if isinstance(item, str):
+                    doc_id = item
+                elif isinstance(item, Document):
+                    doc_id = item.metadata.get("doc_id")
+                else:
+                    doc_id = None
+                if not isinstance(doc_id, str) or not doc_id:
+                    raise ValueError(
+                        f"Retriever result for query {query_id!r} is missing "
+                        "a non-empty document ID (string result or 'doc_id' "
+                        "in document metadata)."
+                    )
+                ids.append(doc_id)
+            extracted.append(list(dict.fromkeys(ids)))
+        return extracted
+
+    def _fuse_rankings(self, rankings: Sequence[Sequence[str]]) -> list[str]:
+        if self.fusion_method == "ordered":
+            return list(
+                dict.fromkeys(
+                    doc_id for ranking in rankings for doc_id in ranking
+                )
+            )
+
+        scores: dict[str, float] = {}
+        first_seen: dict[str, int] = {}
+        for ranking in rankings:
+            for rank, doc_id in enumerate(ranking, start=1):
+                first_seen.setdefault(doc_id, len(first_seen))
+                scores[doc_id] = scores.get(doc_id, 0.0) + 1 / (
+                    self.rrf_k + rank
+                )
+        return sorted(
+            scores,
+            key=lambda doc_id: (-scores[doc_id], first_seen[doc_id]),
+        )
 
     def evaluate(
         self,
-        retriever: BaseRetriever,
+        retriever: BaseRetriever | RetrievalStrategy,
         ground_truth_dataset: Mapping[str, Any] | None = None,
         experiment_name: str | None = None,
     ) -> dict[str, float]:
-        """Evaluate a retriever against a ``queries``/``qrels`` dataset."""
+        """Evaluate a retrieval strategy against a ``queries``/``qrels`` dataset.
+
+        A strategy may return one ranked sequence, or multiple ranked sequences
+        for each input query. The latter are fused using ``fusion_method``.
+        """
+        strategy = as_retrieval_strategy(retriever)
         dataset = (
             self.ground_truth_dataset
             if ground_truth_dataset is None
@@ -218,16 +310,38 @@ class Evaluator:
             evaluated_qrels[query_id] = positive_qrels
             validated_queries.append((query_id, query))
 
-        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            ranked_results = executor.map(
-                lambda item: self._retrieve_ranked_ids(
-                    retriever,
-                    item[0],
-                    item[1],
-                ),
-                validated_queries,
+        retrieve_many = getattr(strategy, "retrieve_many", None)
+        if callable(retrieve_many):
+            batch_results = retrieve_many(
+                [query for _, query in validated_queries],
+                max_concurrency=self.max_workers,
             )
-            run = dict(ranked_results)
+            if (
+                isinstance(batch_results, (str, bytes))
+                or not isinstance(batch_results, Sequence)
+                or len(batch_results) != len(validated_queries)
+            ):
+                raise ValueError(
+                    "Batch retrieval must return one result for each input query "
+                    "in the same order."
+                )
+            run = dict(
+                    self._score_retrieval_result(query_id, results)
+                for (query_id, _), results in zip(
+                    validated_queries, batch_results, strict=True
+                )
+            )
+        else:
+            with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+                ranked_results = executor.map(
+                    lambda item: self._retrieve_ranked_ids(
+                        strategy,
+                        item[0],
+                        item[1],
+                    ),
+                    validated_queries,
+                )
+                run = dict(ranked_results)
 
         metrics = self._evaluate_rankings(evaluated_qrels, run)
 
@@ -236,3 +350,29 @@ class Evaluator:
 
         self._write_metrics_to_csv(metrics, experiment_name=experiment_name)
         return metrics
+
+    def evaluate_many(
+        self,
+        strategies: Mapping[str, BaseRetriever | RetrievalStrategy],
+        ground_truth_dataset: Mapping[str, Any] | None = None,
+        experiment_name: str | None = None,
+    ) -> dict[str, dict[str, float]]:
+        """Compare named retrieval strategies against the same labeled queries."""
+        if not strategies:
+            raise ValueError("strategies must contain at least one named strategy")
+        if any(not isinstance(name, str) or not name.strip() for name in strategies):
+            raise ValueError("Strategy names must be non-empty strings")
+
+        results: dict[str, dict[str, float]] = {}
+        for name, strategy in strategies.items():
+            row_experiment_name = (
+                f"{experiment_name.strip()}/{name.strip()}"
+                if experiment_name is not None
+                else name.strip()
+            )
+            results[name] = self.evaluate(
+                strategy,
+                ground_truth_dataset=ground_truth_dataset,
+                experiment_name=row_experiment_name,
+            )
+        return results
