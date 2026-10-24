@@ -132,6 +132,17 @@ class HuggingFaceModelClient(ModelClient):
         if self._pipeline is None:
             model_id = self.model_id
             device = self.config.get("device", DEFAULT_GENERATION_DEVICE)
+            if device >= 0:
+                import torch
+
+                if not torch.cuda.is_available():
+                    warnings.warn(
+                        "No supported GPU is available to PyTorch; "
+                        "falling back to CPU for text generation.",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
+                    device = -1
             _disable_triton_bmm_when_python_headers_are_missing(device)
             pipeline_kwargs = {
                 "max_new_tokens": self.config.get(
